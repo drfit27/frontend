@@ -22,6 +22,7 @@ onMounted(() => {
     animation: false,
     fullscreenButton: false,
     vrButton: false,
+    creditContainer: document.createElement('div')
   })
   
   // 天地图影像

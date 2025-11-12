@@ -10,12 +10,24 @@
       </button>
       <div v-if="isPicking" class="hint">请在地图上单击选择位置…</div>
       <div class="search-by-address">
-        <input
-          v-model="addressQuery"
-          placeholder="输入地址，例如：北京天安门"
-          @keyup.enter="searchBaiduAndAdd"
-        />
-        <button @click="searchBaiduAndAdd">地址搜索并添加</button>
+        <h4>地址搜索</h4>
+        <div class="search-input-wrapper">
+          <input
+            v-model="addressQuery"
+            placeholder="输入地址搜索，例如：北京天安门"
+            @keyup.enter="searchBaiduAndAdd"
+            :disabled="isSearching"
+          />
+          <button 
+            @click="searchBaiduAndAdd" 
+            :disabled="isSearching || !addressQuery.trim()"
+            class="search-button"
+          >
+            {{ isSearching ? '搜索中...' : '搜索并定位' }}
+          </button>
+        </div>
+        <div v-if="searchError" class="error-message">{{ searchError }}</div>
+        <div v-if="searchSuccess" class="success-message">{{ searchSuccess }}</div>
       </div>
       <div class="annotation-list" v-if="annotations.length > 0">
         <h4>已添加的标注 ({{ annotations.length }})</h4>
@@ -74,7 +86,10 @@ export default {
       showAnnotations: true,
       clickHandler: null,
       temporaryPoint: null,
-      addressQuery: ''
+      addressQuery: '',
+      isSearching: false,
+      searchError: '',
+      searchSuccess: ''
     }
   },
   emits: ['annotation-added'],
@@ -151,35 +166,171 @@ export default {
       return { lat: mgLat, lon: mgLon };
     },
 
+    // 带超时的fetch请求
+    async fetchWithTimeout(url, options = {}, timeout = 10000) {
+      const controller = new AbortController()
+      const id = setTimeout(() => controller.abort(), timeout)
+      
+      try {
+        const response = await fetch(url, {
+          ...options,
+          signal: controller.signal
+        })
+        clearTimeout(id)
+        return response
+      } catch (error) {
+        clearTimeout(id)
+        if (error.name === 'AbortError') {
+          throw new Error('请求超时，请检查网络连接')
+        }
+        throw error
+      }
+    },
+
+    // 使用Nominatim（OpenStreetMap）作为备用服务
+    async searchNominatim(query) {
+      const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=1&accept-language=zh-CN,zh,en`
+      console.log('[PlaceNameAnnotation] Trying Nominatim:', url)
+      
+      try {
+        const resp = await this.fetchWithTimeout(url, {
+          headers: {
+            'Accept': 'application/json',
+            'User-Agent': 'CesiumMapApp/1.0'
+          }
+        }, 8000)
+        
+        if (!resp.ok) {
+          throw new Error(`Nominatim请求失败: ${resp.status}`)
+        }
+        
+        const data = await resp.json()
+        console.log('[PlaceNameAnnotation] Nominatim response:', data)
+        
+        if (!data || data.length === 0) {
+          throw new Error('未找到该地址')
+        }
+        
+        const result = data[0]
+        const longitude = parseFloat(result.lon)
+        const latitude = parseFloat(result.lat)
+        const name = result.display_name || query
+        
+        return { name, longitude, latitude, source: 'nominatim' }
+      } catch (e) {
+        console.error('[PlaceNameAnnotation] Nominatim error:', e)
+        throw e
+      }
+    },
+
+    // 百度地图搜索
+    async searchBaidu(query) {
+      const ak = 'hxQigLG0cMPhOwMKoQZDUt8vGHutAehO'
+      const url = `https://api.map.baidu.com/geocoding/v3/?address=${encodeURIComponent(query)}&output=json&ak=${ak}`
+      console.log('[PlaceNameAnnotation] Trying Baidu:', url)
+      
+      try {
+        const resp = await this.fetchWithTimeout(url, {
+          headers: { 'Accept': 'application/json' }
+        }, 8000)
+        
+        if (!resp.ok) {
+          throw new Error(`百度API请求失败: ${resp.status}`)
+        }
+        
+        const data = await resp.json()
+        console.log('[PlaceNameAnnotation] Baidu response:', data)
+        
+        if (!data || data.status !== 0 || !data.result || !data.result.location) {
+          const errorMsg = data?.message || '未找到该地址'
+          throw new Error(errorMsg)
+        }
+        
+        const bdLon = Number(data.result.location.lng)
+        const bdLat = Number(data.result.location.lat)
+        
+        // BD09 -> WGS84 坐标转换
+        const { gcjLon, gcjLat } = this.bd09ToGcj02(bdLon, bdLat)
+        const { wgsLon, wgsLat } = this.gcj02ToWgs84(gcjLon, gcjLat)
+        
+        const name = data.result.formatted_address || data.result.level || query
+        
+        return { name, longitude: wgsLon, latitude: wgsLat, source: 'baidu' }
+      } catch (e) {
+        console.error('[PlaceNameAnnotation] Baidu error:', e)
+        throw e
+      }
+    },
+
     async searchBaiduAndAdd() {
       const query = this.addressQuery.trim()
       console.log('[PlaceNameAnnotation] searchBaiduAndAdd clicked, query=', query)
       if (!query) {
-        console.warn('[PlaceNameAnnotation] empty query')
+        this.searchError = '请输入要搜索的地址'
+        setTimeout(() => { this.searchError = '' }, 3000)
         return
       }
+
+      // 重置状态
+      this.isSearching = true
+      this.searchError = ''
+      this.searchSuccess = ''
+
       try {
-        const ak = 'hxQigLG0cMPhOwMKoQZDUt8vGHutAehO'
-        const url = `https://api.map.baidu.com/geocoding/v3/?address=${encodeURIComponent(query)}&output=json&ak=${ak}`
-        console.log('[PlaceNameAnnotation] fetching:', url)
-        const resp = await fetch(url, { headers: { 'Accept': 'application/json' } })
-        console.log('[PlaceNameAnnotation] response status:', resp.status)
-        const data = await resp.json().catch(() => null)
-        console.log('[PlaceNameAnnotation] response json:', data)
-        if (!data || data.status !== 0 || !data.result || !data.result.location) {
-          console.warn('[PlaceNameAnnotation] baidu no result or error status', data && data.status)
-          return
+        let result = null
+        let lastError = null
+        
+        // 先尝试百度地图
+        try {
+          result = await this.searchBaidu(query)
+          console.log('[PlaceNameAnnotation] Baidu search success')
+        } catch (baiduError) {
+          console.warn('[PlaceNameAnnotation] Baidu failed, trying fallback:', baiduError)
+          lastError = baiduError
+          
+          // 如果百度失败，尝试使用Nominatim作为备用
+          try {
+            result = await this.searchNominatim(query)
+            console.log('[PlaceNameAnnotation] Nominatim search success')
+          } catch (nominatimError) {
+            console.error('[PlaceNameAnnotation] All services failed')
+            lastError = nominatimError
+            throw lastError
+          }
         }
-        const bdLon = Number(data.result.location.lng)
-        const bdLat = Number(data.result.location.lat)
-        console.log('[PlaceNameAnnotation] baidu BD09 coords:', { bdLon, bdLat })
-        const { gcjLon, gcjLat } = this.bd09ToGcj02(bdLon, bdLat)
-        const { wgsLon, wgsLat } = this.gcj02ToWgs84(gcjLon, gcjLat)
-        console.log('[PlaceNameAnnotation] converted coords:', { wgsLon, wgsLat })
-        const name = data.result.level || query
-        this.addAnnotationFromSearch(name, wgsLon, wgsLat)
+        
+        if (!result) {
+          throw new Error('搜索失败，请稍后重试')
+        }
+        
+        // 添加标注并飞到位置
+        const annotation = this.addAnnotationFromSearch(result.name, result.longitude, result.latitude)
+        
+        const sourceText = result.source === 'baidu' ? '百度地图' : 'OpenStreetMap'
+        this.searchSuccess = `成功定位到: ${result.name} (${sourceText})`
+        setTimeout(() => { this.searchSuccess = '' }, 5000)
+        
+        return annotation
+        
       } catch (e) {
-        console.error('[PlaceNameAnnotation] baidu search error', e)
+        console.error('[PlaceNameAnnotation] search error:', e)
+        
+        // 提供更友好的错误提示
+        let errorMessage = '搜索失败'
+        if (e.message.includes('超时')) {
+          errorMessage = '请求超时，请检查网络连接'
+        } else if (e.message.includes('网络') || e.message.includes('Failed to fetch') || e.message.includes('Network')) {
+          errorMessage = '网络连接失败，请检查您的网络设置'
+        } else if (e.message.includes('未找到')) {
+          errorMessage = '未找到该地址，请尝试其他关键词或更详细的地址'
+        } else {
+          errorMessage = `搜索失败: ${e.message}`
+        }
+        
+        this.searchError = errorMessage
+        setTimeout(() => { this.searchError = '' }, 7000)
+      } finally {
+        this.isSearching = false
       }
     },
 
@@ -273,12 +424,19 @@ export default {
       this.saveAnnotations();
       this.renderAnnotations();
 
+      // 飞到该位置，使用合适的视角高度
       this.viewer.camera.flyTo({
-        destination: Cesium.Cartesian3.fromDegrees(longitude, latitude, 2000)
+        destination: Cesium.Cartesian3.fromDegrees(longitude, latitude, 2000),
+        orientation: {
+          heading: Cesium.Math.toRadians(0),
+          pitch: Cesium.Math.toRadians(-45),
+          roll: 0.0
+        },
+        duration: 2.0 // 飞行动画时长2秒
       });
 
       this.$emit('annotation-added', annotation);
-      this.addressQuery = '';
+      // 不清空搜索框，让用户可以继续搜索其他地址
       return annotation;
     },
 
@@ -415,6 +573,72 @@ export default {
 
 .annotation-item button:hover {
   background: #cc0000;
+}
+
+.search-by-address {
+  margin-top: 15px;
+  padding-top: 15px;
+  border-top: 1px solid #555;
+}
+
+.search-by-address h4 {
+  margin: 0 0 10px 0;
+  font-size: 14px;
+  color: #fff;
+}
+
+.search-input-wrapper {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.search-input-wrapper input {
+  flex: 1;
+  padding: 8px;
+  border: 1px solid #555;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.1);
+  color: white;
+  font-size: 14px;
+}
+
+.search-input-wrapper input::placeholder {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.search-input-wrapper input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.search-button {
+  padding: 8px 16px;
+  white-space: nowrap;
+}
+
+.search-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  background: #555 !important;
+}
+
+.error-message {
+  color: #ff6b6b;
+  font-size: 12px;
+  margin-top: 5px;
+  padding: 5px;
+  background: rgba(255, 107, 107, 0.1);
+  border-radius: 4px;
+}
+
+.success-message {
+  color: #51cf66;
+  font-size: 12px;
+  margin-top: 5px;
+  padding: 5px;
+  background: rgba(81, 207, 102, 0.1);
+  border-radius: 4px;
 }
 
 .add-modal {
